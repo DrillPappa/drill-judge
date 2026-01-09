@@ -1,7 +1,8 @@
 import os
 import uuid
 import base64
-from typing import Dict, Any
+import json
+import asyncio
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -11,16 +12,19 @@ from openai import OpenAI
 from app.prompts import SYSTEM_PROMPT, USER_PROMPT
 from app.judge_schema import JudgeResult
 from app.video_frames import extract_frames_from_bytes
+from app.job_store import init_db, create_job, set_status, get_job
+
 
 app = FastAPI(title="Drill Judge API")
-
-# Enkel in-memory jobstore (MVP)
-JOBS: Dict[str, Dict[str, Any]] = {}
 
 def to_data_url_jpeg(path: str) -> str:
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
+
+@app.on_event("startup")
+def _startup():
+    init_db()
 
 @app.get("/")
 def root():
@@ -28,7 +32,6 @@ def root():
 
 @app.get("/upload", response_class=HTMLResponse)
 def upload_page():
-    # Minimal uppladdningssida (valfri men skön)
     return """
     <!doctype html>
     <html>
@@ -65,6 +68,7 @@ def upload_page():
 
             const r = await fetch('/judge', { method: 'POST', body: fd });
             const j = await r.json();
+
             if (!r.ok) {
               document.getElementById('status').textContent = 'Fel: ' + (j.error || r.status);
               document.getElementById('out').textContent = JSON.stringify(j, null, 2);
@@ -74,8 +78,7 @@ def upload_page():
             const jobId = j.job_id;
             document.getElementById('status').textContent = 'Jobb skapat: ' + jobId + ' (bearbetar...)';
 
-            // Poll resultat
-            for (let i=0; i<120; i++) { // ~120 sek
+            for (let i=0; i<180; i++) { // ~3 min
               await new Promise(res => setTimeout(res, 1000));
               const rr = await fetch('/result/' + jobId);
               const jj = await rr.json();
@@ -101,20 +104,20 @@ def upload_page():
     """
 
 @app.get("/result/{job_id}")
-def get_result(job_id: str):
-    job = JOBS.get(job_id)
+def result(job_id: str):
+    job = get_job(job_id)
     if not job:
         return JSONResponse(status_code=404, content={"error": "job_id finns inte"})
-    # returnera status + ev resultat
+
     out = {"job_id": job_id, "status": job["status"]}
     if job["status"] == "done":
-        out["result"] = job["result"]
+        out["result"] = json.loads(job["result_json"] or "{}")
     if job["status"] == "error":
-        out["error"] = job.get("error", "okänt fel")
+        out["error"] = job.get("error") or "okänt fel"
     return JSONResponse(out)
 
 @app.post("/judge")
-async def judge_video(video: UploadFile = File(...)):
+async def judge(video: UploadFile = File(...)):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return JSONResponse(status_code=500, content={"error": "OPENAI_API_KEY saknas"})
@@ -124,18 +127,16 @@ async def judge_video(video: UploadFile = File(...)):
     max_frames = int(os.getenv("MAX_FRAMES", "12"))
     max_seconds = int(os.getenv("MAX_SECONDS", "12"))
 
-    # Skapa jobb
+    # Skapa jobb i SQLite direkt (överlever om processen startar om)
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"status": "queued"}
+    create_job(job_id)
 
-    # Läs videon nu (snabbt) och starta background-task
     video_bytes = await video.read()
 
     async def run_job():
         try:
-            JOBS[job_id]["status"] = "processing"
+            set_status(job_id, "processing")
 
-            # 1) Extrahera frames
             frame_paths = extract_frames_from_bytes(
                 video_bytes,
                 fps=fps,
@@ -143,16 +144,13 @@ async def judge_video(video: UploadFile = File(...)):
                 max_seconds=max_seconds,
             )
             if not frame_paths:
-                JOBS[job_id]["status"] = "error"
-                JOBS[job_id]["error"] = "Kunde inte extrahera frames."
+                set_status(job_id, "error", error="Kunde inte extrahera frames.")
                 return
 
-            # 2) Bygg innehåll: text + bilder
             content = [{"type": "input_text", "text": USER_PROMPT}]
             for p in frame_paths:
                 content.append({"type": "input_image", "image_url": to_data_url_jpeg(p)})
 
-            # 3) OpenAI-anrop
             client = OpenAI(api_key=api_key)
             resp = client.responses.parse(
                 model=model,
@@ -164,16 +162,10 @@ async def judge_video(video: UploadFile = File(...)):
             )
 
             result = resp.output_parsed.model_dump()
-
-            JOBS[job_id]["status"] = "done"
-            JOBS[job_id]["result"] = result
+            set_status(job_id, "done", result_json=json.dumps(result, ensure_ascii=False))
 
         except Exception as e:
-            JOBS[job_id]["status"] = "error"
-            JOBS[job_id]["error"] = str(e)
+            set_status(job_id, "error", error=str(e))
 
-    # Starta bakgrundsjobb (utan att blocka requesten)
-    import asyncio
     asyncio.create_task(run_job())
-
     return JSONResponse({"job_id": job_id, "status": "queued"})
